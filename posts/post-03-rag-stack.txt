@@ -1,0 +1,10 @@
+Built a lightweight RAG stack for internal engineering docs that stays fully offline and runs on modest hardware.
+
+• Local embeddings + vector store
+• Simple chunking tuned for code + markdown
+• Retrieval + LLM pipeline with citation grounding
+
+No cloud dependency, no data leaving the building. Perfect for regulated or air-gapped environments.
+
+Happy to share architecture notes if anyone is tackling the same problem.
+#RAG #LLM #EmbeddedSystems #Privacy #Engineering
