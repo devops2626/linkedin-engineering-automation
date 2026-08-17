@@ -7,12 +7,29 @@ LinkedIn Posts API, then moves the file to archived/.
 
 import os
 import sys
-import glob
+import logging
 import shutil
 from pathlib import Path
 
 import requests
 
+# ---------------------------------------------------------------------------
+# Logging configuration
+# ---------------------------------------------------------------------------
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+
+logger = logging.getLogger("linkedin.auto_poster")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 ACCESS_TOKEN = os.environ.get("LINKEDIN_ACCESS_TOKEN")
 PERSON_ID = os.environ.get("LINKEDIN_PERSON_ID")  # raw id or full urn:li:person:...
 
@@ -31,7 +48,7 @@ def get_next_post() -> tuple[Path | None, str | None]:
     """Return the path and content of the next pending post (lexicographic order)."""
     posts_dir = Path("posts")
     if not posts_dir.is_dir():
-        print("posts/ directory not found.")
+        logger.warning("posts/ directory not found.")
         return None, None
 
     # Only consider .txt and .md files that are not already archived
@@ -39,15 +56,16 @@ def get_next_post() -> tuple[Path | None, str | None]:
         list(posts_dir.glob("*.txt")) + list(posts_dir.glob("*.md"))
     )
     if not candidates:
-        print("No pending posts found in posts/.")
+        logger.info("No pending posts found in posts/.")
         return None, None
 
     post_path = candidates[0]
     content = post_path.read_text(encoding="utf-8").strip()
     if not content:
-        print(f"Post file is empty: {post_path}")
+        logger.warning("Post file is empty: %s", post_path)
         return None, None
 
+    logger.debug("Selected post file: %s (%d chars)", post_path.name, len(content))
     return post_path, content
 
 
@@ -81,14 +99,18 @@ def post_to_linkedin(text: str) -> None:
         "isReshareDisabledByAuthor": False,
     }
 
+    logger.info("Sending post to LinkedIn (author=%s)", author)
     response = requests.post(url, json=payload, headers=headers, timeout=30)
 
     if response.status_code == 201:
         post_id = response.headers.get("x-restli-id", "unknown")
-        print(f"Successfully posted to LinkedIn! Post ID: {post_id}")
+        logger.info("Successfully posted to LinkedIn! Post ID: %s", post_id)
     else:
-        print(f"Failed to post: {response.status_code}")
-        print(response.text)
+        logger.error(
+            "Failed to post: %s – %s",
+            response.status_code,
+            response.text,
+        )
         raise RuntimeError(f"LinkedIn API error {response.status_code}")
 
 
@@ -108,24 +130,28 @@ def archive_post(post_path: Path) -> None:
             counter += 1
 
     shutil.move(str(post_path), str(destination))
-    print(f"Archived {post_path} → {destination}")
+    logger.info("Archived %s → %s", post_path, destination)
 
 
 def main() -> int:
+    logger.info("LinkedIn Engineering Auto-Poster starting")
+
     path, content = get_next_post()
     if not content or not path:
-        print("Nothing to post. Exiting cleanly.")
+        logger.info("Nothing to post. Exiting cleanly.")
         return 0
 
-    print(f"Posting: {path.name}")
+    logger.info("Posting: %s", path.name)
     post_to_linkedin(content)
     archive_post(path)
+
+    logger.info("Run completed successfully")
     return 0
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
-    except Exception as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    except Exception:
+        logger.exception("Unhandled error during execution")
         sys.exit(1)
