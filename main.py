@@ -471,7 +471,6 @@ def main() -> int:
             document_title=document_title,
         )
 
-        # First comment is best-effort (post already succeeded)
         if comment_path and post_urn and post_urn != "unknown":
             comment_text = comment_path.read_text(encoding="utf-8").strip()
             if comment_text:
