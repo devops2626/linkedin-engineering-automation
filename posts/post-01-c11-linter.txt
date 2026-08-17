@@ -1,0 +1,6 @@
+Just open-sourced a strict POSIX shell-based linter and test suite enforcing strict C11 compliance rules for embedded systems development.
+
+Ensuring memory safety and MISRA-like discipline in resource-constrained environments shouldn't require heavy toolchains. Built this lightweight framework to run straight out of standard POSIX environments and mobile shells.
+
+Check out the code and drop your thoughts below!
+#EmbeddedSystems #CProgramming #Automation #DevOps #C11
