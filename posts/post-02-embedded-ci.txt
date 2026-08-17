@@ -1,0 +1,11 @@
+Shipping a minimal CI pipeline for bare-metal and RTOS firmware that runs on every PR without a full board farm.
+
+Key pieces:
+• Static analysis + unit tests in QEMU
+• Deterministic build with fixed toolchains
+• Hardware-in-the-loop gated behind labels
+
+Result: faster feedback for the team and fewer "works on my desk" surprises.
+
+What does your embedded CI look like?
+#EmbeddedSystems #CI #DevOps #Firmware #Automation
