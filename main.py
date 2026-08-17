@@ -224,12 +224,11 @@ def validate_document(document_path: Path) -> None:
             f"({size / (1024 * 1024):.1f} MB)"
         )
 
-    # Prove the file is readable
     try:
         with open(document_path, "rb") as fh:
             fh.read(64)
     except OSError as exc:
-        raise DocumentValidationError(f"Cannot read document: {exc}") from exc
+        raise DocumentValidationError(f"Cannot read document: {exc}") from exp
 
     logger.debug("Document validated: %s (%.1f MB)", document_path.name, size / (1024 * 1024))
 
@@ -264,7 +263,11 @@ def request_with_retry(
 
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after and retry_after.isdigit() else backoff * (2 ** (attempt - 1))
+                wait = (
+                    float(retry_after)
+                    if retry_after and retry_after.isdigit()
+                    else backoff * (2 ** (attempt - 1))
+                )
                 logger.warning(
                     "Attempt %d/%d: rate-limited (429). Waiting %.1fs before retry.",
                     attempt,
@@ -388,7 +391,6 @@ def upload_document_binary(upload_url: str, file_path: Path) -> None:
                     "Payload too large (413). File exceeds LinkedIn size limits."
                 )
             if resp.status_code in (403, 404):
-                # Upload URL may have expired or is invalid – not worth retrying
                 raise BinaryUploadError(
                     f"Binary upload rejected ({resp.status_code}): {body}"
                 )
@@ -408,12 +410,13 @@ def upload_document_binary(upload_url: str, file_path: Path) -> None:
                     continue
                 raise last_exc
 
-            # Non-retryable client error
             raise BinaryUploadError(f"Binary upload failed ({resp.status_code}): {body}")
 
-        except OSError as exp:
+        except BinaryUploadError:
+            raise
+        except OSError as exc:
             raise BinaryUploadError(f"Cannot open/read document for upload: {exc}") from exp
-        except (RequestsConnectionError, RequestsTimeout) as exp:
+        except (RequestsConnectionError, RequestsTimeout) as exc:
             logger.warning(
                 "Binary upload attempt %d/%d network/timeout error: %s",
                 attempt,
@@ -441,7 +444,7 @@ def get_document_status(document_urn: str) -> str:
             logger.warning("Status fetch returned %s: %s", resp.status_code, resp.text[:200])
             return "STATUS_FETCH_FAILED"
         return resp.json().get("status", "UNKNOWN")
-    except RequestException as exp:
+    except RequestException as exc:
         logger.warning("Failed to fetch document status: %s", exp)
         return "STATUS_FETCH_FAILED"
 
@@ -721,7 +724,6 @@ def main() -> int:
             document_title=document_title,
         )
 
-        # First comment is best-effort; never blocks archival of a successful post
         if comment_path and post_urn and post_urn != "unknown":
             comment_text = comment_path.read_text(encoding="utf-8").strip()
             if comment_text:
@@ -729,7 +731,6 @@ def main() -> int:
             else:
                 logger.warning("Comment file is empty: %s", comment_path)
 
-        # Only archive after a fully successful post
         archive_files(text_path, document_path, comment_path)
 
     except DocumentValidationError as exp:
