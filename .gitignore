@@ -15,3 +15,7 @@ env/
 # Local secrets (never commit)
 .env
 *.token
+
+# Logs (rotating file handler)
+logs/
+*.log
