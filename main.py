@@ -9,23 +9,67 @@ import os
 import sys
 import logging
 import shutil
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import requests
 
 # ---------------------------------------------------------------------------
-# Logging configuration
+# Logging configuration (console + rotating file)
 # ---------------------------------------------------------------------------
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
+LOG_FILE = LOG_DIR / "auto_poster.log"
 
-logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
+# Rotating file settings (overridable via env)
+LOG_MAX_BYTES = int(os.environ.get("LOG_MAX_BYTES", 5 * 1024 * 1024))  # 5 MB
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUP_COUNT", 5))           # keep 5 backups
 
-logger = logging.getLogger("linkedin.auto_poster")
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+def setup_logging() -> logging.Logger:
+    """Configure root logger with console + rotating file handlers."""
+    logger = logging.getLogger("linkedin.auto_poster")
+    logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+
+    # Avoid duplicate handlers if setup_logging() is called more than once
+    if logger.handlers:
+        return logger
+
+    formatter = logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT)
+
+    # Console handler (always present – useful in GitHub Actions)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Rotating file handler (optional – enabled when LOG_DIR is writable)
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            filename=LOG_FILE,
+            maxBytes=LOG_MAX_BYTES,
+            backupCount=LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+        logger.debug(
+            "Rotating file handler enabled → %s (maxBytes=%d, backupCount=%d)",
+            LOG_FILE,
+            LOG_MAX_BYTES,
+            LOG_BACKUP_COUNT,
+        )
+    except OSError as exc:
+        # In restricted environments (e.g. some CI runners) we may not be able to write files.
+        # Fall back to console-only logging.
+        logger.warning("Could not create rotating file handler: %s. Using console only.", exc)
+
+    return logger
+
+
+logger = setup_logging()
 
 # ---------------------------------------------------------------------------
 # Configuration
