@@ -330,7 +330,6 @@ def _request_with_retry(
                 continue
             raise
 
-    # Should not reach here, but just in case
     if last_exc:
         raise last_exc
     raise RuntimeError("Request failed after retries with no exception captured")
@@ -357,7 +356,7 @@ def initialize_document_upload(owner: str) -> dict:
         )
     except RequestException as exc:
         logger.error("initializeUpload network failure: %s", exc)
-        raise UploadInitError(f"initializeUpload network failure: {exc}") from exp
+        raise UploadInitError(f"initializeUpload network failure: {exc}") from exc
 
     if resp.status_code not in (200, 201):
         body = resp.text[:500]
@@ -381,7 +380,7 @@ def initialize_document_upload(owner: str) -> dict:
         logger.error("Unexpected initializeUpload response: %s", resp.text[:500])
         raise UploadInitError(
             f"Unexpected initializeUpload response structure: {exc}"
-        ) from exp
+        ) from exc
 
     logger.info("Document URN: %s", value["document"])
     return value
@@ -403,7 +402,7 @@ def upload_document_binary(upload_url: str, file_path: Path) -> None:
                 timeout=120,
             )
     except OSError as exc:
-        logger.error("Cannot open document for upload: %s", exp)
+        logger.error("Cannot open document for upload: %s", exc)
         raise BinaryUploadError(f"Cannot open document for upload: {exc}") from exp
     except RequestException as exp:
         logger.error("Binary upload network failure: %s", exp)
@@ -445,7 +444,6 @@ def get_document_status(document_urn: str) -> str:
         return resp.json().get("status", "UNKNOWN")
     except RequestException as exp:
         logger.warning("Failed to fetch document status: %s", exp)
-        # Return a sentinel so the poller can decide whether to continue
         return "STATUS_FETCH_FAILED"
 
 
