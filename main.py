@@ -26,6 +26,12 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+from requests.exceptions import (
+    ConnectionError as RequestsConnectionError,
+    HTTPError,
+    RequestException,
+    Timeout as RequestsTimeout,
+)
 
 # ---------------------------------------------------------------------------
 # Logging configuration (console + rotating file)
@@ -80,6 +86,38 @@ def setup_logging() -> logging.Logger:
 logger = setup_logging()
 
 # ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+class LinkedInError(Exception):
+    """Base class for LinkedIn auto-poster errors."""
+
+
+class ConfigError(LinkedInError):
+    """Missing or invalid configuration / secrets."""
+
+
+class DocumentValidationError(LinkedInError):
+    """Document file failed pre-upload checks (size, readability, etc.)."""
+
+
+class UploadInitError(LinkedInError):
+    """initializeUpload request failed."""
+
+
+class BinaryUploadError(LinkedInError):
+    """Binary PUT of the document failed."""
+
+
+class DocumentProcessingError(LinkedInError):
+    """Document entered PROCESSING_FAILED or timed out."""
+
+
+class PostCreationError(LinkedInError):
+    """Final /rest/posts call failed."""
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 ACCESS_TOKEN = os.environ.get("LINKEDIN_ACCESS_TOKEN")
@@ -89,12 +127,19 @@ LINKEDIN_VERSION = "202607"
 
 DOCUMENT_EXTENSIONS = {".pdf", ".ppt", ".pptx", ".doc", ".docx"}
 
+# LinkedIn hard limit
+MAX_DOCUMENT_BYTES = 100 * 1024 * 1024  # 100 MB
+
 # Polling defaults (can be overridden via env)
 POLL_TIMEOUT = float(os.environ.get("DOCUMENT_POLL_TIMEOUT", 180))
 POLL_INITIAL_INTERVAL = float(os.environ.get("DOCUMENT_POLL_INITIAL", 1.0))
 POLL_MAX_INTERVAL = float(os.environ.get("DOCUMENT_POLL_MAX", 12.0))
 POLL_MULTIPLIER = float(os.environ.get("DOCUMENT_POLL_MULTIPLIER", 2.0))
 POLL_JITTER = float(os.environ.get("DOCUMENT_POLL_JITTER", 0.25))
+
+# Retry defaults for transient network failures
+UPLOAD_MAX_RETRIES = int(os.environ.get("UPLOAD_MAX_RETRIES", 3))
+UPLOAD_RETRY_BACKOFF = float(os.environ.get("UPLOAD_RETRY_BACKOFF", 2.0))
 
 
 def _api_headers(content_type: str | None = "application/json") -> dict:
@@ -115,6 +160,19 @@ def normalize_author(person_id: str) -> str:
     return f"urn:li:person:{person_id}"
 
 
+def require_credentials() -> None:
+    """Raise ConfigError early if required secrets are missing."""
+    missing = []
+    if not ACCESS_TOKEN:
+        missing.append("LINKEDIN_ACCESS_TOKEN")
+    if not PERSON_ID:
+        missing.append("LINKEDIN_PERSON_ID")
+    if missing:
+        raise ConfigError(
+            f"Missing required environment variable(s): {', '.join(missing)}"
+        )
+
+
 def find_companion_document(post_path: Path) -> Optional[Path]:
     """
     Look for a document file that shares the same stem as the post text file.
@@ -127,6 +185,53 @@ def find_companion_document(post_path: Path) -> Optional[Path]:
         if candidate.is_file():
             return candidate
     return None
+
+
+def validate_document(document_path: Path) -> None:
+    """
+    Pre-flight checks before attempting upload.
+
+    Raises DocumentValidationError on failure.
+    """
+    if not document_path.is_file():
+        raise DocumentValidationError(f"Document not found: {document_path}")
+
+    if document_path.suffix.lower() not in DOCUMENT_EXTENSIONS:
+        raise DocumentValidationError(
+            f"Unsupported document type: {document_path.suffix} "
+            f"(allowed: {', '.join(sorted(DOCUMENT_EXTENSIONS))})"
+        )
+
+    try:
+        size = document_path.stat().st_size
+    except OSError as exc:
+        raise DocumentValidationError(
+            f"Cannot read document metadata for {document_path}: {exc}"
+        ) from exc
+
+    if size == 0:
+        raise DocumentValidationError(f"Document is empty: {document_path}")
+
+    if size > MAX_DOCUMENT_BYTES:
+        raise DocumentValidationError(
+            f"Document exceeds LinkedIn 100 MB limit: {document_path} "
+            f"({size / (1024 * 1024):.1f} MB)"
+        )
+
+    # Quick readability check
+    try:
+        with open(document_path, "rb") as fh:
+            fh.read(64)
+    except OSError as exc:
+        raise DocumentValidationError(
+            f"Cannot read document file {document_path}: {exc}"
+        ) from exc
+
+    logger.debug(
+        "Document validation passed: %s (%.1f MB)",
+        document_path.name,
+        size / (1024 * 1024),
+    )
 
 
 def get_next_post() -> tuple[Optional[Path], Optional[str], Optional[Path]]:
@@ -164,6 +269,74 @@ def get_next_post() -> tuple[Optional[Path], Optional[str], Optional[Path]]:
 
 
 # ---------------------------------------------------------------------------
+# HTTP helpers with retry
+# ---------------------------------------------------------------------------
+
+def _request_with_retry(
+    method: str,
+    url: str,
+    *,
+    max_retries: int = UPLOAD_MAX_RETRIES,
+    backoff: float = UPLOAD_RETRY_BACKOFF,
+    **kwargs,
+) -> requests.Response:
+    """
+    Perform an HTTP request with limited retries on transient failures.
+
+    Retries on connection errors, timeouts, and 5xx responses.
+    Does **not** retry on 4xx (client errors).
+    """
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.request(method, url, **kwargs)
+
+            # Retry on server-side errors
+            if resp.status_code >= 500:
+                logger.warning(
+                    "Attempt %d/%d: server error %s for %s %s – will retry",
+                    attempt,
+                    max_retries,
+                    resp.status_code,
+                    method,
+                    url,
+                )
+                last_exc = HTTPError(
+                    f"Server error {resp.status_code}: {resp.text[:300]}",
+                    response=resp,
+                )
+                if attempt < max_retries:
+                    sleep = backoff * (2 ** (attempt - 1))
+                    time.sleep(sleep)
+                    continue
+                raise last_exc
+
+            return resp
+
+        except (RequestsConnectionError, RequestsTimeout) as exc:
+            logger.warning(
+                "Attempt %d/%d: network error for %s %s – %s",
+                attempt,
+                max_retries,
+                method,
+                url,
+                exc,
+            )
+            last_exc = exc
+            if attempt < max_retries:
+                sleep = backoff * (2 ** (attempt - 1))
+                time.sleep(sleep)
+                continue
+            raise
+
+    # Should not reach here, but just in case
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Request failed after retries with no exception captured")
+
+
+# ---------------------------------------------------------------------------
 # Document upload lifecycle
 # ---------------------------------------------------------------------------
 
@@ -173,32 +346,85 @@ def initialize_document_upload(owner: str) -> dict:
     payload = {"initializeUploadRequest": {"owner": owner}}
 
     logger.info("Initializing document upload (owner=%s)", owner)
-    resp = requests.post(url, json=payload, headers=_api_headers(), timeout=30)
-    if resp.status_code not in (200, 201):
-        logger.error("initializeUpload failed: %s – %s", resp.status_code, resp.text)
-        raise RuntimeError(f"initializeUpload failed: {resp.status_code}")
 
-    value = resp.json()["value"]
+    try:
+        resp = _request_with_retry(
+            "POST",
+            url,
+            json=payload,
+            headers=_api_headers(),
+            timeout=30,
+        )
+    except RequestException as exc:
+        logger.error("initializeUpload network failure: %s", exc)
+        raise UploadInitError(f"initializeUpload network failure: {exc}") from exp
+
+    if resp.status_code not in (200, 201):
+        body = resp.text[:500]
+        logger.error("initializeUpload failed: %s – %s", resp.status_code, body)
+
+        if resp.status_code in (401, 403):
+            raise UploadInitError(
+                f"initializeUpload auth/permission error ({resp.status_code}). "
+                "Check LINKEDIN_ACCESS_TOKEN and w_member_social scope. "
+                f"Response: {body}"
+            )
+        raise UploadInitError(
+            f"initializeUpload failed with status {resp.status_code}: {body}"
+        )
+
+    try:
+        value = resp.json()["value"]
+        if "uploadUrl" not in value or "document" not in value:
+            raise KeyError("uploadUrl or document missing from response")
+    except (ValueError, KeyError) as exc:
+        logger.error("Unexpected initializeUpload response: %s", resp.text[:500])
+        raise UploadInitError(
+            f"Unexpected initializeUpload response structure: {exc}"
+        ) from exp
+
     logger.info("Document URN: %s", value["document"])
     return value
 
 
 def upload_document_binary(upload_url: str, file_path: Path) -> None:
     """Step 2 – PUT the binary file to the temporary upload URL."""
-    logger.info("Uploading binary: %s (%d bytes)", file_path.name, file_path.stat().st_size)
+    size = file_path.stat().st_size
+    logger.info("Uploading binary: %s (%.1f MB)", file_path.name, size / (1024 * 1024))
 
-    with open(file_path, "rb") as fh:
-        # LinkedIn expects a raw binary upload; no Content-Type required
-        resp = requests.put(
-            upload_url,
-            data=fh,
-            headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
-            timeout=120,
-        )
+    try:
+        with open(file_path, "rb") as fh:
+            # LinkedIn expects a raw binary upload; no Content-Type required
+            resp = _request_with_retry(
+                "PUT",
+                upload_url,
+                data=fh,
+                headers={"Authorization": f"Bearer {ACCESS_TOKEN}"},
+                timeout=120,
+            )
+    except OSError as exc:
+        logger.error("Cannot open document for upload: %s", exp)
+        raise BinaryUploadError(f"Cannot open document for upload: {exc}") from exp
+    except RequestException as exp:
+        logger.error("Binary upload network failure: %s", exp)
+        raise BinaryUploadError(f"Binary upload network failure: {exc}") from exp
 
     if resp.status_code not in (200, 201):
-        logger.error("Binary upload failed: %s – %s", resp.status_code, resp.text)
-        raise RuntimeError(f"Binary upload failed: {resp.status_code}")
+        body = resp.text[:500]
+        logger.error("Binary upload failed: %s – %s", resp.status_code, body)
+
+        if resp.status_code == 401:
+            raise BinaryUploadError(
+                "Binary upload unauthorized (401). Token may have expired."
+            )
+        if resp.status_code == 413:
+            raise BinaryUploadError(
+                "Binary upload rejected (413 Payload Too Large). "
+                "File may exceed LinkedIn limits."
+            )
+        raise BinaryUploadError(
+            f"Binary upload failed with status {resp.status_code}: {body}"
+        )
 
     logger.info("Binary upload complete")
 
@@ -207,9 +433,20 @@ def get_document_status(document_urn: str) -> str:
     """Fetch current processing status of a document asset."""
     encoded = requests.utils.quote(document_urn, safe="")
     url = f"https://api.linkedin.com/rest/documents/{encoded}"
-    resp = requests.get(url, headers=_api_headers(content_type=None), timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("status", "UNKNOWN")
+
+    try:
+        resp = _request_with_retry(
+            "GET",
+            url,
+            headers=_api_headers(content_type=None),
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return resp.json().get("status", "UNKNOWN")
+    except RequestException as exp:
+        logger.warning("Failed to fetch document status: %s", exp)
+        # Return a sentinel so the poller can decide whether to continue
+        return "STATUS_FETCH_FAILED"
 
 
 def wait_until_available(
@@ -224,12 +461,14 @@ def wait_until_available(
     """
     Poll document status with exponential backoff + jitter until AVAILABLE.
 
-    Raises TimeoutError or RuntimeError on failure.
+    Raises DocumentProcessingError on timeout or PROCESSING_FAILED.
     """
     deadline = time.monotonic() + timeout
     interval = initial_interval
     last_status: Optional[str] = None
     attempt = 0
+    consecutive_fetch_failures = 0
+    max_consecutive_fetch_failures = 5
 
     logger.info(
         "Polling document status (timeout=%.0fs, initial=%.1fs, max=%.1fs)",
@@ -248,24 +487,43 @@ def wait_until_available(
                 f"within {timeout}s (last status: {last_status}, attempts: {attempt})"
             )
             logger.error(msg)
-            raise TimeoutError(msg)
+            raise DocumentProcessingError(msg)
 
         status = get_document_status(document_urn)
 
-        if status != last_status:
-            logger.info("[%d] Document status → %s", attempt, status)
-            last_status = status
+        if status == "STATUS_FETCH_FAILED":
+            consecutive_fetch_failures += 1
+            logger.warning(
+                "Status fetch failed (%d/%d consecutive)",
+                consecutive_fetch_failures,
+                max_consecutive_fetch_failures,
+            )
+            if consecutive_fetch_failures >= max_consecutive_fetch_failures:
+                raise DocumentProcessingError(
+                    f"Unable to retrieve document status after "
+                    f"{max_consecutive_fetch_failures} consecutive failures"
+                )
         else:
-            logger.debug("[%d] Still %s …", attempt, status)
+            consecutive_fetch_failures = 0
 
-        if status == "AVAILABLE":
-            logger.info("Document is AVAILABLE after %d attempt(s)", attempt)
-            return status
+            if status != last_status:
+                logger.info("[%d] Document status → %s", attempt, status)
+                last_status = status
+            else:
+                logger.debug("[%d] Still %s …", attempt, status)
 
-        if status == "PROCESSING_FAILED":
-            msg = f"Document processing failed for {document_urn}"
-            logger.error(msg)
-            raise RuntimeError(msg)
+            if status == "AVAILABLE":
+                logger.info("Document is AVAILABLE after %d attempt(s)", attempt)
+                return status
+
+            if status == "PROCESSING_FAILED":
+                msg = (
+                    f"Document processing failed for {document_urn}. "
+                    "Possible causes: unsupported format, corrupt file, "
+                    "or LinkedIn internal error."
+                )
+                logger.error(msg)
+                raise DocumentProcessingError(msg)
 
         remaining = deadline - time.monotonic()
         sleep_time = min(interval, remaining, max_interval)
@@ -280,13 +538,16 @@ def wait_until_available(
 
 def upload_and_prepare_document(document_path: Path, owner: str) -> str:
     """
-    Full document lifecycle:
+    Full document lifecycle with validation and structured error handling:
+      0. validate file
       1. initializeUpload
       2. binary PUT
       3. poll until AVAILABLE
 
     Returns the document URN ready for use in a post.
     """
+    validate_document(document_path)
+
     init = initialize_document_upload(owner)
     upload_url = init["uploadUrl"]
     document_urn = init["document"]
@@ -312,12 +573,9 @@ def post_to_linkedin(
 
     When document_urn is supplied the post becomes a native document post.
     """
-    if not ACCESS_TOKEN or not PERSON_ID:
-        raise RuntimeError(
-            "Missing LINKEDIN_ACCESS_TOKEN or LINKEDIN_PERSON_ID environment variables."
-        )
+    require_credentials()
 
-    author = normalize_author(PERSON_ID)
+    author = normalize_author(PERSON_ID)  # type: ignore[arg-type]
 
     payload: dict = {
         "author": author,
@@ -339,23 +597,49 @@ def post_to_linkedin(
                 "title": document_title or "Document",
             }
         }
-        logger.info("Creating native document post (urn=%s, title=%s)", document_urn, document_title)
+        logger.info(
+            "Creating native document post (urn=%s, title=%s)",
+            document_urn,
+            document_title,
+        )
     else:
         logger.info("Creating text-only post (author=%s)", author)
 
-    response = requests.post(
-        "https://api.linkedin.com/rest/posts",
-        json=payload,
-        headers=_api_headers(),
-        timeout=30,
-    )
+    try:
+        response = _request_with_retry(
+            "POST",
+            "https://api.linkedin.com/rest/posts",
+            json=payload,
+            headers=_api_headers(),
+            timeout=30,
+        )
+    except RequestException as exp:
+        logger.error("Post creation network failure: %s", exp)
+        raise PostCreationError(f"Post creation network failure: {exc}") from exp
 
     if response.status_code == 201:
         post_id = response.headers.get("x-restli-id", "unknown")
         logger.info("Successfully posted to LinkedIn! Post ID: %s", post_id)
-    else:
-        logger.error("Failed to post: %s – %s", response.status_code, response.text)
-        raise RuntimeError(f"LinkedIn API error {response.status_code}")
+        return
+
+    body = response.text[:500]
+    logger.error("Failed to post: %s – %s", response.status_code, body)
+
+    if response.status_code in (401, 403):
+        raise PostCreationError(
+            f"Post creation auth/permission error ({response.status_code}). "
+            "Check token scope (w_member_social) and that PERSON_ID matches the token owner. "
+            f"Response: {body}"
+        )
+    if response.status_code == 422:
+        raise PostCreationError(
+            f"Post creation rejected (422 Unprocessable Entity). "
+            "Often caused by invalid document URN or malformed payload. "
+            f"Response: {body}"
+        )
+    raise PostCreationError(
+        f"Post creation failed with status {response.status_code}: {body}"
+    )
 
 
 def archive_files(*paths: Path) -> None:
@@ -376,8 +660,12 @@ def archive_files(*paths: Path) -> None:
                 destination = archived_dir / f"{stem}_{counter}{suffix}"
                 counter += 1
 
-        shutil.move(str(path), str(destination))
-        logger.info("Archived %s → %s", path, destination)
+        try:
+            shutil.move(str(path), str(destination))
+            logger.info("Archived %s → %s", path, destination)
+        except OSError as exp:
+            logger.error("Failed to archive %s: %s", path, exp)
+            # Non-fatal – the post already succeeded
 
 
 # ---------------------------------------------------------------------------
@@ -387,29 +675,59 @@ def archive_files(*paths: Path) -> None:
 def main() -> int:
     logger.info("LinkedIn Engineering Auto-Poster starting")
 
+    try:
+        require_credentials()
+    except ConfigError as exp:
+        logger.error("%s", exp)
+        return 1
+
     text_path, commentary, document_path = get_next_post()
     if not commentary or not text_path:
         logger.info("Nothing to post. Exiting cleanly.")
         return 0
 
-    logger.info("Posting: %s%s", text_path.name, f" + {document_path.name}" if document_path else "")
+    logger.info(
+        "Posting: %s%s",
+        text_path.name,
+        f" + {document_path.name}" if document_path else "",
+    )
 
     document_urn: Optional[str] = None
     document_title: Optional[str] = None
 
-    if document_path:
-        owner = normalize_author(PERSON_ID)  # type: ignore[arg-type]
-        document_urn = upload_and_prepare_document(document_path, owner)
-        document_title = document_path.name
+    try:
+        if document_path:
+            owner = normalize_author(PERSON_ID)  # type: ignore[arg-type]
+            document_urn = upload_and_prepare_document(document_path, owner)
+            document_title = document_path.name
 
-    post_to_linkedin(
-        commentary,
-        document_urn=document_urn,
-        document_title=document_title,
-    )
+        post_to_linkedin(
+            commentary,
+            document_urn=document_urn,
+            document_title=document_title,
+        )
 
-    # Archive both the text file and the document (if any)
-    archive_files(text_path, document_path)
+        # Only archive after a fully successful publish
+        archive_files(text_path, document_path)
+
+    except DocumentValidationError as exp:
+        logger.error("Document validation failed – post aborted: %s", exp)
+        return 1
+    except UploadInitError as exp:
+        logger.error("Upload initialization failed – post aborted: %s", exp)
+        return 1
+    except BinaryUploadError as exp:
+        logger.error("Binary upload failed – post aborted: %s", exp)
+        return 1
+    except DocumentProcessingError as exp:
+        logger.error("Document processing failed – post aborted: %s", exp)
+        return 1
+    except PostCreationError as exp:
+        logger.error("Post creation failed – files NOT archived: %s", exp)
+        return 1
+    except LinkedInError as exp:
+        logger.error("LinkedIn error – post aborted: %s", exp)
+        return 1
 
     logger.info("Run completed successfully")
     return 0
